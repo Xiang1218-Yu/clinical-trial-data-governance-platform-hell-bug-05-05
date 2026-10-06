@@ -80,17 +80,17 @@ export function dashboard(studyId?: string) {
   const scopedSubjects = scope(subjects, studyId);
   const scopedEvents = scope(adverseEvents, studyId);
   const scopedQueries = scope(queries, studyId);
-  const scopedFindings = qualityFindings;
+  const scopedFindings = scope(qualityFindings, studyId);
   const completed = scopedSubjects.filter((item) => item.status === 'COMPLETED').length;
-  const scopedDefinitions = signalDefinitions.filter((item) => item.enabled);
-  const scopedReviews = studyId ? reviewTasks : reviewTasks;
-  const scopedBatches = studyId ? dataBatches : dataBatches;
+  const scopedDefinitions = scope(signalDefinitions, studyId).filter((item) => item.enabled);
+  const scopedReviews = scope(reviewTasks, studyId);
+  const scopedBatches = scope(dataBatches, studyId);
   const severeEvents = scopedEvents.filter((item) => item.seriousness || item.severity === 'LIFE_THREATENING');
   const qualityScore = scopedFindings.length === 0
     ? 100
     : Math.max(0, Math.round(100 - scopedFindings.filter((item) => item.status === 'OPEN').length * 7));
   return {
-    studies: scopedStudies,
+    studies: scopedStudies.map(clone),
     metrics: {
       activeStudies: scopedStudies.filter((item) => item.status === 'ACTIVE' || item.status === 'RECRUITING').length,
       enrolledSubjects: scopedStudies.reduce((sum, item) => sum + item.enrolled, 0),
@@ -224,7 +224,7 @@ export function listOutbox(studyId?: string) { const eventIds = new Set(scope(ad
 export function listReviewTasks(studyId?: string): ReviewTask[] { return scope(reviewTasks, studyId).map(clone); }
 export function listQualityFindings(studyId?: string): QualityFinding[] { return scope(qualityFindings, studyId).map(clone); }
 export function listSignals(studyId?: string) {
-  const definitions = signalDefinitions.filter((item) => item.enabled);
+  const definitions = scope(signalDefinitions, studyId).filter((item) => item.enabled);
   return definitions
     .sort((left, right) => left.term.localeCompare(right.term))
     .map((definition) => ({
