@@ -4,8 +4,8 @@ import {
   qualityFindings, queries, reviewTasks, signalDefinitions, sites, studies, subjects,
 } from './store.js';
 import type {
-  AdverseEvent, DataBatch, EventAudit, EventSeverity, EventStatus, ExportAttempt, ExportJob,
-  OutboxMessage, QualityFinding, ReviewTask, SignalDefinition,
+  AdverseEvent, DataBatch, DataQuery, EventAudit, EventSeverity, EventStatus, ExportAttempt,
+  ExportJob, OutboxMessage, QualityFinding, ReviewTask, SignalDefinition, Study, Subject,
 } from './domain.js';
 
 const statusTransitions: Record<EventStatus, EventStatus[]> = {
@@ -56,7 +56,35 @@ function appendOutbox(aggregateId: string, aggregateType: OutboxMessage['aggrega
   outboxMessages.push(message);
   return message;
 }
-function scope<T extends { studyId: string }>(items: T[], studyId?: string) { return items.filter((item) => !studyId || item.studyId === studyId); }
+// Always return a fresh array so query-time aggregation never aliases or rewrites the global store.
+function scope<T extends { studyId: string }>(items: readonly T[], studyId?: string) {
+  return items.filter((item) => !studyId || item.studyId === studyId);
+}
+interface StudyScope {
+  studyId?: string;
+  studies: Study[];
+  subjects: Subject[];
+  events: AdverseEvent[];
+  queries: DataQuery[];
+  findings: QualityFinding[];
+  reviews: ReviewTask[];
+  batches: DataBatch[];
+  definitions: SignalDefinition[];
+}
+// Build one scoped dataset for a request; every dashboard metric and signal result derives from it.
+function createStudyScope(studyId?: string): StudyScope {
+  return {
+    studyId,
+    studies: studyId ? studies.filter((item) => item.id === studyId) : studies.slice(),
+    subjects: scope(subjects, studyId),
+    events: scope(adverseEvents, studyId),
+    queries: scope(queries, studyId),
+    findings: scope(qualityFindings, studyId),
+    reviews: scope(reviewTasks, studyId),
+    batches: scope(dataBatches, studyId),
+    definitions: scope(signalDefinitions, studyId),
+  };
+}
 function expectedRecords(studyId: string, type: ExportJob['type']) {
   const studySubjects = subjects.filter((item) => item.studyId === studyId).length;
   const studyEvents = adverseEvents.filter((item) => item.studyId === studyId).length;
@@ -64,11 +92,13 @@ function expectedRecords(studyId: string, type: ExportJob['type']) {
   const weights = { SDTM: 18, SAFETY: 11, RAW: 31 };
   return Math.max(1, studySubjects * weights[type] + studyEvents * 7 + studyQueries * 3 + Math.ceil(studyFor(studyId).enrolled / 10));
 }
-function signalFor(studyId: string, definition: SignalDefinition, asOf = new Date()) {
+// Signal results always run on the request's scoped dataset, and are additionally restricted to
+// the definition's own study so a shared/unscoped collection can never carry another study's events.
+function signalFor(definition: SignalDefinition, scoped: StudyScope, asOf = new Date()) {
   const end = asOf.getTime();
   const start = end - definition.lookbackDays * 24 * 60 * 60 * 1000;
-  const events = adverseEvents.filter((event) => event.studyId === studyId && event.term === definition.term && Number.isFinite(Date.parse(event.onsetDate)) && Date.parse(event.onsetDate) >= start && Date.parse(event.onsetDate) <= end);
-  const study = studyFor(studyId);
+  const events = scoped.events.filter((event) => event.studyId === definition.studyId && event.term === definition.term && Number.isFinite(Date.parse(event.onsetDate)) && Date.parse(event.onsetDate) >= start && Date.parse(event.onsetDate) <= end);
+  const study = scoped.studies.find((item) => item.id === definition.studyId) ?? studyFor(definition.studyId);
   const observed = events.length;
   const expected = Math.max(0.1, study.enrolled * definition.expectedRate * definition.lookbackDays / 365);
   const score = Number((observed / expected).toFixed(2));
@@ -76,37 +106,32 @@ function signalFor(studyId: string, definition: SignalDefinition, asOf = new Dat
 }
 
 export function dashboard(studyId?: string) {
-  const scopedStudies = studyId ? studies.filter((item) => item.id === studyId) : studies;
-  const scopedSubjects = scope(subjects, studyId);
-  const scopedEvents = scope(adverseEvents, studyId);
-  const scopedQueries = scope(queries, studyId);
-  const scopedFindings = qualityFindings;
-  const completed = scopedSubjects.filter((item) => item.status === 'COMPLETED').length;
-  const scopedDefinitions = signalDefinitions.filter((item) => item.enabled);
-  const scopedReviews = studyId ? reviewTasks : reviewTasks;
-  const scopedBatches = studyId ? dataBatches : dataBatches;
-  const severeEvents = scopedEvents.filter((item) => item.seriousness || item.severity === 'LIFE_THREATENING');
-  const qualityScore = scopedFindings.length === 0
+  // Establish the study boundary before any aggregation; when studyId is absent everything is global.
+  const scoped = createStudyScope(studyId);
+  const enabledDefinitions = scoped.definitions.filter((item) => item.enabled);
+  const completed = scoped.subjects.filter((item) => item.status === 'COMPLETED').length;
+  const severeEvents = scoped.events.filter((item) => item.seriousness || item.severity === 'LIFE_THREATENING');
+  const qualityScore = scoped.findings.length === 0
     ? 100
-    : Math.max(0, Math.round(100 - scopedFindings.filter((item) => item.status === 'OPEN').length * 7));
+    : Math.max(0, Math.round(100 - scoped.findings.filter((item) => item.status === 'OPEN').length * 7));
   return {
-    studies: scopedStudies,
+    studies: scoped.studies.map(clone),
     metrics: {
-      activeStudies: scopedStudies.filter((item) => item.status === 'ACTIVE' || item.status === 'RECRUITING').length,
-      enrolledSubjects: scopedStudies.reduce((sum, item) => sum + item.enrolled, 0),
+      activeStudies: scoped.studies.filter((item) => item.status === 'ACTIVE' || item.status === 'RECRUITING').length,
+      enrolledSubjects: scoped.studies.reduce((sum, item) => sum + item.enrolled, 0),
       dataQuality: qualityScore,
-      openQueries: scopedQueries.filter((item) => item.status === 'OPEN').length,
-      blockerFindings: scopedFindings.filter((item) => item.severity === 'BLOCKER' && item.status === 'OPEN').length,
+      openQueries: scoped.queries.filter((item) => item.status === 'OPEN').length,
+      blockerFindings: scoped.findings.filter((item) => item.severity === 'BLOCKER' && item.status === 'OPEN').length,
       seriousEvents: severeEvents.length,
-      completionRate: Math.round((completed / Math.max(scopedSubjects.length, 1)) * 100),
-      overdueQueries: scopedQueries.filter((item) => item.status === 'OPEN' && item.dueAt && Date.parse(item.dueAt) < Date.now()).length,
+      completionRate: Math.round((completed / Math.max(scoped.subjects.length, 1)) * 100),
+      overdueQueries: scoped.queries.filter((item) => item.status === 'OPEN' && item.dueAt && Date.parse(item.dueAt) < Date.now()).length,
     },
-    eventTrend: buildMonthlyTrend(scopedEvents),
-    safetySignals: scopedDefinitions.map((definition) => signalFor(definition.studyId, definition)),
+    eventTrend: buildMonthlyTrend(scoped.events),
+    safetySignals: enabledDefinitions.map((definition) => signalFor(definition, scoped)),
     workflow: {
-      unassignedReviews: scopedReviews.filter((item) => item.status === 'UNASSIGNED').length,
-      escalatedReviews: scopedReviews.filter((item) => item.status === 'ESCALATED').length,
-      quarantinedBatches: scopedBatches.filter((item) => item.status === 'QUARANTINED').length,
+      unassignedReviews: scoped.reviews.filter((item) => item.status === 'UNASSIGNED').length,
+      escalatedReviews: scoped.reviews.filter((item) => item.status === 'ESCALATED').length,
+      quarantinedBatches: scoped.batches.filter((item) => item.status === 'QUARANTINED').length,
     },
   };
 }
@@ -221,15 +246,21 @@ export function snapshot(studyId?: string) {
 export function listAudits(eventId: string): EventAudit[] { return auditEntries.filter((item) => item.eventId === eventId).map(clone); }
 export function listTimeline(eventId: string) { return eventTimeline.filter((item) => item.eventId === eventId).map(clone); }
 export function listOutbox(studyId?: string) { const eventIds = new Set(scope(adverseEvents, studyId).map((item) => item.id)); return outboxMessages.filter((item) => !studyId || (item.aggregateType === 'ADVERSE_EVENT' ? eventIds.has(item.aggregateId) : exports.some((job) => job.id === item.aggregateId && job.studyId === studyId))).map(clone); }
+export function listStudies(studyId?: string): Study[] {
+  return (studyId ? studies.filter((item) => item.id === studyId) : studies.slice()).map(clone);
+}
 export function listReviewTasks(studyId?: string): ReviewTask[] { return scope(reviewTasks, studyId).map(clone); }
 export function listQualityFindings(studyId?: string): QualityFinding[] { return scope(qualityFindings, studyId).map(clone); }
 export function listSignals(studyId?: string) {
-  const definitions = signalDefinitions.filter((item) => item.enabled);
-  return definitions
+  // Only evaluate definitions that belong to the requested study; each result is computed from
+  // the same scoped dataset and remains restricted to its definition's own study.
+  const scoped = createStudyScope(studyId);
+  return scoped.definitions
+    .filter((item) => item.enabled)
     .sort((left, right) => left.term.localeCompare(right.term))
     .map((definition) => ({
       definition: clone(definition),
-      result: signalFor(definition.studyId, definition),
+      result: signalFor(definition, scoped),
       requestedStudyId: studyId ?? null,
     }));
 }

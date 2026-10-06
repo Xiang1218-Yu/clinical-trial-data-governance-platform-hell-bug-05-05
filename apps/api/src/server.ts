@@ -3,9 +3,8 @@ import cors from '@fastify/cors';
 import {
   cancelExport, createEvent, createExport, dashboard, DomainConflictError, ingestBatch,
   listAudits, listEvents, listOutbox, listQualityFindings, listReviewTasks, listSignals,
-  listTimeline, retryExport, snapshot, updateEventStatus,
+  listStudies, listTimeline, retryExport, snapshot, updateEventStatus,
 } from './services.js';
-import { studies } from './store.js';
 import type { EventSeverity, EventStatus, ExportJob } from './domain.js';
 
 const app = Fastify({ logger: true });
@@ -19,7 +18,7 @@ app.setErrorHandler((error, _request, reply) => {
 
 app.get('/api/health', async () => ({ status: 'ok', service: 'clinical-trial-api', timestamp: new Date().toISOString() }));
 app.get('/api/dashboard', async (request) => dashboard((request.query as { studyId?: string }).studyId));
-app.get('/api/studies', async () => studies);
+app.get('/api/studies', async (request) => listStudies((request.query as { studyId?: string }).studyId));
 app.get('/api/sites', async (request) => snapshot((request.query as { studyId?: string }).studyId).sites);
 app.get('/api/subjects', async (request) => snapshot((request.query as { studyId?: string }).studyId).subjects);
 app.get('/api/queries', async (request) => snapshot((request.query as { studyId?: string }).studyId).queries);
